@@ -1247,7 +1247,7 @@ struct ParserBuilder {
         buffer_lstm.rewind_one_step();
         stacki.push_back(bufferi.back());
         bufferi.pop_back();
-      } 
+      }
       else if (ac=='S' && ac2=='W'){ //SWAP
         assert(stack.size() > 2); // dummy symbol means > 2 (not >= 2)
 
