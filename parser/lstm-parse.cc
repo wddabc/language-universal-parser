@@ -330,18 +330,12 @@ struct ParserBuilder {
       // parser
       p_brown_embeddings = parsing_model->add_lookup_parameters(BROWN_CLUSTERS_COUNT, Dim({BROWN_DIM, 1}));
       p_brown2l = parsing_model->add_parameters(Dim({LSTM_INPUT_DIM, BROWN_DIM}));
-      // tagger
-      p_tagging_brown_embeddings = parsing_model->add_lookup_parameters(BROWN_CLUSTERS_COUNT, Dim({BROWN_DIM, 1}));
-      p_tagging_brown2l = parsing_model->add_parameters(Dim({LSTM_INPUT_DIM, BROWN_DIM}));
     }
   
     if (corpus.brown2_clusters.size() > 0) {
       // parser
       p_brown2_embeddings = parsing_model->add_lookup_parameters(BROWN2_CLUSTERS_COUNT, Dim({BROWN2_DIM, 1}));
       p_brown22l = parsing_model->add_parameters(Dim({LSTM_INPUT_DIM, BROWN2_DIM}));
-      // tagger
-      p_tagging_brown2_embeddings = parsing_model->add_lookup_parameters(BROWN2_CLUSTERS_COUNT, Dim({BROWN2_DIM, 1}));
-      p_tagging_brown22l = parsing_model->add_parameters(Dim({LSTM_INPUT_DIM, BROWN2_DIM}));
     }
 
     if (corpus.pretrained.size() > 0) {
@@ -476,313 +470,6 @@ struct ParserBuilder {
     else if ((x >> 1) == 0x7e) return 6;
     else return 0;
   }
-
-  // if build_training_graph == false, this runs greedy decoding
-  // the chosen tags are inserted into the "results" vector (in training just returns the reference)
-  Expression log_prob_tagger(ComputationGraph& hg,
-                       vector<TokenInfo>& sent,
-                       double *right,
-                       bool build_training_graph) {
-    // Initialize the bidirectional LSTM.
-    tagging_forward_lstm.new_graph(hg);
-    tagging_backward_lstm.new_graph(hg);
-    tagging_forward_lstm.start_new_sequence();
-    tagging_backward_lstm.start_new_sequence();
-
-    // variables in the computation graph representing parameters
-    Expression pretrained_unk;
-    if (corpus.pretrained.size() > 0) {
-      pretrained_unk = parameter(hg, p_pretrained_unk);
-    }
-    Expression compressed_typology_to_parser_state, observed_to_compressed_typology;
-    if (corpus.typological_properties_map.size() > 0) {
-      compressed_typology_to_parser_state = parameter(hg, p_compressed_typology_to_parser_state);
-      observed_to_compressed_typology = parameter(hg, p_observed_to_compressed_typology);
-    }
-    Expression tagging_word2l = parameter(hg, p_tagging_word2l);
-    Expression tagging_spell2l = parameter(hg, p_tagging_spell2l);
-    Expression tagging_t2l;
-    if (corpus.pretrained.size() > 0) {
-      tagging_t2l = parameter(hg, p_tagging_t2l);
-    }
-    Expression tagging_compressed_typology_to_lstm_input;
-    Expression compressed_typology;
-    if (TYPOLOGY_MODE == TYPOLOGY_MODE_HADAMARD_LEXICAL ||
-        TYPOLOGY_MODE == TYPOLOGY_MODE_LINEAR_LEXICAL ||
-        TYPOLOGY_MODE == TYPOLOGY_MODE_CASCADE_LEXICAL) {
-      tagging_compressed_typology_to_lstm_input = parameter(hg, p_tagging_compressed_typology_to_lstm_input);
-      // .. also use the compressed typological embedding
-      Expression observed_typology = const_lookup(hg, p_observed_typology, sent[0].lang_id);
-      vector<float> observed_typology_vector = as_vector(hg.incremental_forward(observed_typology));
-      compressed_typology = tanh(observed_to_compressed_typology * observed_typology);
-      if (build_training_graph && BLOCK_DROPOUT_TYPOLOGY_EMBEDDING > 0.0) {
-        compressed_typology = block_dropout(compressed_typology, BLOCK_DROPOUT_TYPOLOGY_EMBEDDING);
-      }
-    } else {
-      vector<float> zeros(COMPRESSED_TYPOLOGY_DIM, 0.0);  // set x_values to change the inputs to the network
-      compressed_typology = input(hg, {COMPRESSED_TYPOLOGY_DIM}, &zeros);
-    }
-    // layer between bidirecationl lstm and tagger state
-    Expression tagging_state_bias = parameter(hg, p_tagging_state_bias); // bias
-    Expression tagging_bi2state = parameter(hg, p_tagging_bi2state); // weight matrix
-    // softmax layer
-    Expression tagging_state2softmax = parameter(hg, p_tagging_state2softmax);
-    Expression tagging_softmax_bias = parameter(hg, p_tagging_softmax_bias);
-    // bias for the token representation
-    Expression tagging_ib = parameter(hg, p_tagging_ib);
-    // start of sentence and end of sentence token representations
-    Expression tagging_sos = parameter(hg, p_tagging_sos);
-    Expression tagging_eos = parameter(hg, p_tagging_eos);
-    // brown to input
-    Expression tagging_brown2l;
-    Expression tagging_brown22l;
-    if (p_tagging_brown2l.mp) { tagging_brown2l = parameter(hg, p_tagging_brown2l); }
-    if (p_tagging_brown22l.mp) { tagging_brown22l = parameter(hg, p_tagging_brown22l); }
-
-    // initialize character-level embeddings
-    Expression word_end = parameter(hg, p_end_of_word);
-    Expression word_start = parameter(hg, p_start_of_word); 
-    if (USE_SPELLING) {
-      fw_char_lstm.new_graph(hg);
-      bw_char_lstm.new_graph(hg);
-    }
-
-    // hg.incremental_forward();
-
-    // compute token embeddings, which will be used as input to the bidirectional LSTM
-    vector<Expression> token_embeddings(sent.size());
-    for (unsigned i = 0; i < sent.size(); ++i) {
-    
-      // initialize the embedding of this token with bias parameters
-      Expression i_i = tagging_ib;
-
-      // .. add the (learned) word embedding
-      Expression word_embedding;
-      if (sent[i].training_oov) {
-        // OOV words are replaced with a special UNK symbol.
-        word_embedding = lookup(hg, p_tagging_w, kUNK_SYMBOL);
-      } else {
-        // lookup the learned embedding of a regular word.
-        assert(sent[i].word_id < VOCAB_SIZE);
-        word_embedding = lookup(hg, p_tagging_w, sent[i].word_id);
-      }
-      if (build_training_graph || BLOCK_DROPOUT_WORD_EMBEDDING == 0.0) {
-        word_embedding = block_dropout(word_embedding, BLOCK_DROPOUT_WORD_EMBEDDING);
-      } else if (!build_training_graph && BLOCK_DROPOUT_WORD_EMBEDDING == 1.0) {
-        word_embedding = 0.0 * word_embedding;
-      }
-      i_i = affine_transform({i_i, tagging_word2l, word_embedding});
-
-      // .. add the (learned) character-based spell embedding of this word
-      if (USE_SPELLING) {
-        Expression spell_embedding;
-        
-        // Get the surface form string.
-        vector<unsigned> &char_ids = corpus.wordIntsToCharInts[sent[i].word_id];
-        assert(char_ids.size() > 0);
-        
-        // encode this token using both left-to-right and right-to-left character LSTM
-        fw_char_lstm.start_new_sequence();
-        bw_char_lstm.start_new_sequence();
-        fw_char_lstm.add_input(word_start);
-        bw_char_lstm.add_input(word_end);
-        unsigned sequence_length = char_ids.size();
-        for (unsigned i = 0; i < sequence_length; ++i) {
-          unsigned fw_char_id = char_ids[i];
-          // skip OOV characters (e.g., dev set is japanese while training set is english)
-          if (corpus.training_char_vocab.count(fw_char_id) > 0) {
-            Expression fw_char_emb = lookup(hg, p_char_emb, fw_char_id);
-            fw_char_lstm.add_input(fw_char_emb);
-          }
-          unsigned bw_char_id = char_ids[sequence_length - i - 1];
-          // skip OOV characters (e.g., dev set is japanese while training set is english)
-          if (corpus.training_char_vocab.count(bw_char_id) > 0) {
-            Expression bw_char_emb = lookup(hg, p_char_emb, bw_char_id);
-            bw_char_lstm.add_input(bw_char_emb);
-          }
-        }
-        fw_char_lstm.add_input(word_end);
-        bw_char_lstm.add_input(word_start);
-        Expression fw_i = fw_char_lstm.back();
-        Expression bw_i = bw_char_lstm.back();
-
-        // concatenate left-to-right and right-to-left character-based encoding
-        vector<Expression> tt = {fw_i, bw_i};
-        spell_embedding = concatenate(tt); //and this goes into the buffer...
-
-        // use block dropout to stochastically zero out the spell embedding.
-        if (build_training_graph || BLOCK_DROPOUT_SPELL_EMBEDDING == 0.0) {
-          spell_embedding = block_dropout(spell_embedding, BLOCK_DROPOUT_SPELL_EMBEDDING);
-        } else if (!build_training_graph && BLOCK_DROPOUT_SPELL_EMBEDDING == 1.0) {
-          spell_embedding = 0.0 * spell_embedding;
-        }
-        
-        // actually add the spell embedding
-        i_i = affine_transform({i_i, tagging_spell2l, spell_embedding});
-      }
-      
-      // .. also use brown cluster embeddings
-      if (corpus.brown_clusters.size() > 0) {
-        // by default, assign the unkown brown cluster id, then update it if this word actually appears in the brown clusters file
-        unsigned brown_cluster_id = corpus.brown_clusters[kUNK_BROWN];
-        if (corpus.brown_clusters.count(sent[i].word_id) > 0) {
-          brown_cluster_id = corpus.brown_clusters[sent[i].word_id];
-        }
-        // lookup the embedding of this brown cluster id
-        Expression brown_embedding = lookup(hg, p_tagging_brown_embeddings, brown_cluster_id);
-        i_i = affine_transform({i_i, tagging_brown2l, brown_embedding});
-      }
-
-      // .. also use brown2 cluster embeddings
-      if (corpus.brown2_clusters.size() > 0) {
-        // by default, assign the unkown brown cluster id, then update it if this word actually appears in the brown clusters file
-        unsigned brown2_cluster_id = corpus.brown2_clusters[kUNK_BROWN];
-        if (corpus.brown2_clusters.count(sent[i].word_id) > 0) {
-          brown2_cluster_id = corpus.brown2_clusters[sent[i].word_id];
-        }
-        // lookup the embedding of this brown cluster id
-        Expression brown2_embedding = lookup(hg, p_tagging_brown2_embeddings, brown2_cluster_id);
-        i_i = affine_transform({i_i, tagging_brown22l, brown2_embedding});
-      }
-
-      // .. also use (pretrained) word embeddings if available
-      if (p_t.mp) {
-        Expression t;
-        if (corpus.pretrained.count(sent[i].word_id) != 0) {
-          t = const_lookup(hg, p_t, sent[i].word_id);
-        } else {
-          t = pretrained_unk;
-        }
-        if (build_training_graph || BLOCK_DROPOUT_PRETRAINED_EMBEDDING == 0.0) {
-          t = block_dropout(t, BLOCK_DROPOUT_PRETRAINED_EMBEDDING);
-        } else if (!build_training_graph && BLOCK_DROPOUT_PRETRAINED_EMBEDDING == 1.0) {
-          t = 0.0 * t;
-        }
-        i_i = affine_transform({i_i, tagging_t2l, t});
-      }
-
-      // .. also use the compressed typological embedding
-      if (TYPOLOGY_MODE == TYPOLOGY_MODE_HADAMARD_LEXICAL ||
-          TYPOLOGY_MODE == TYPOLOGY_MODE_LINEAR_LEXICAL ||
-          TYPOLOGY_MODE == TYPOLOGY_MODE_CASCADE_LEXICAL) {
-        Expression dropped_out_compressed_typology;
-        if (build_training_graph || BLOCK_DROPOUT_TYPOLOGY_EMBEDDING == 0.0) {
-          dropped_out_compressed_typology = block_dropout(compressed_typology, BLOCK_DROPOUT_TYPOLOGY_EMBEDDING);
-        } else if (!build_training_graph && BLOCK_DROPOUT_TYPOLOGY_EMBEDDING == 1.0) {
-          dropped_out_compressed_typology = 0.0 * compressed_typology;
-        }
-        i_i = affine_transform({i_i, tagging_compressed_typology_to_lstm_input, dropped_out_compressed_typology});
-      }
-      
-      // .. nonlinearity
-      i_i = tanh(i_i);
-
-      // .. dropout at training time only
-      if (build_training_graph) {
-        i_i = dropout(i_i, DROPOUT);
-      }
-
-      // token representation is complete
-      token_embeddings[i] = i_i;
-    }
-
-    // compute bidirectional lstm states
-    tagging_forward_lstm.add_input(tagging_sos);
-    tagging_backward_lstm.add_input(tagging_eos);
-    vector<Expression> forward_lstm_outputs;
-    vector<Expression> backward_lstm_outputs;
-    for (unsigned i = 0; i < sent.size(); ++i) {
-      // compute next forward output (represents token i)
-      tagging_forward_lstm.add_input(token_embeddings[i]);
-      forward_lstm_outputs.push_back(tagging_forward_lstm.back());
-      // compute next backward output (represnets token |sent|-1-i)
-      tagging_backward_lstm.add_input(token_embeddings[sent.size()-1-i]);
-      backward_lstm_outputs.push_back(tagging_backward_lstm.back());
-    }
-    // reverse outputs of the backward lstm
-    std::reverse(std::begin(backward_lstm_outputs), std::end(backward_lstm_outputs));
-    
-    // learn/decode next POS tag
-    vector<Expression> negative_log_probs;
-    for (unsigned i = 0; i < sent.size(); ++i) {
-
-      // tagger state = tagging_state_bias + tagging_bi2state * [bi_lstm_output; lang_embedding]
-      Expression bi_lstm_output = concatenate({forward_lstm_outputs[i], backward_lstm_outputs[i], compressed_typology});
-      Expression tagger_state = tanh(affine_transform({tagging_state_bias, tagging_bi2state, bi_lstm_output}));
-      
-      // softmax layer
-      Expression pos_scores = affine_transform({tagging_softmax_bias, tagging_state2softmax, tagger_state});
-      Expression pos_log_probs = log_softmax(pos_scores);
-      vector<float> pos_log_probs_vector = as_vector(hg.incremental_forward(pos_log_probs));
-
-      // predict coarse POS tag
-      unsigned most_likely_coarse_pos_id = 0;
-      for (unsigned i = 1; i < pos_log_probs_vector.size(); ++i) {
-        if (corpus.coarse_pos_vocab.count(i) == 0) { continue; }
-        if (corpus.coarse_pos_vocab.count(most_likely_coarse_pos_id) == 0 || pos_log_probs_vector[i] > pos_log_probs_vector[most_likely_coarse_pos_id]) {
-          most_likely_coarse_pos_id = i;
-        }
-      }
-    
-      // predict fine POS tag
-      unsigned most_likely_fine_pos_id = 0;
-      for (unsigned i = 1; i < pos_log_probs_vector.size() && !corpus.COARSE_ONLY; ++i) {
-        if (corpus.fine_pos_vocab.count(i) == 0) { continue; }
-        if (corpus.fine_pos_vocab.count(most_likely_fine_pos_id) == 0 || pos_log_probs_vector[i] > pos_log_probs_vector[most_likely_fine_pos_id]) {
-          most_likely_fine_pos_id = i;
-        }
-      }
-      
-      // ROOT gets special treatment
-      if (i == sent.size() - 1) {
-        assert(sent[i].word_id == kROOT_SYMBOL);
-        sent[i].predicted_coarse_pos_id = sent[i].coarse_pos_id;
-        if (!corpus.COARSE_ONLY) { sent[i].predicted_coarse_pos_id = sent[i].pos_id; }
-      } else {
-        sent[i].predicted_coarse_pos_id = most_likely_coarse_pos_id;
-        if (!corpus.COARSE_ONLY) { sent[i].predicted_pos_id = most_likely_fine_pos_id; }
-        if (build_training_graph) {
-          bool correct_coarse = most_likely_coarse_pos_id == sent[i].coarse_pos_id;
-          bool correct_fine = most_likely_fine_pos_id == sent[i].pos_id;
-          if (corpus.COARSE_ONLY) {
-            (*right) += correct_coarse; 
-          } else {
-            (*right) += (correct_coarse + correct_fine) / 2.0;
-          }
-        }
-      }
-
-      // learn
-      if (build_training_graph) {
-        Expression coarse_log_prob = - pick(pos_log_probs, sent[i].coarse_pos_id);
-        // add the fine log prob (unless --coarse_only was specified)
-        Expression negative_log_prob = 
-          corpus.COARSE_ONLY?
-          coarse_log_prob : 
-          coarse_log_prob - pick(pos_log_probs, sent[i].pos_id);
-        negative_log_probs.push_back(negative_log_prob);
-      }
-
-      // report bug
-      for (auto nonpositive : pos_log_probs_vector) { 
-        if (nonpositive >= 0.01) { 
-          cerr << "ERROR: log_softmax = " << nonpositive << endl; 
-          assert(nonpositive <= 0.01); 
-        } 
-      }
-      // hg.incremental_forward();
-    }
-
-    // final cost for this sentence.
-    Expression tot_neglogprob;
-    if (build_training_graph) {
-      tot_neglogprob = sum(negative_log_probs);
-      hg.incremental_forward(tot_neglogprob);
-      assert(tot_neglogprob.pg != nullptr);
-    }
-    return tot_neglogprob;
-  }
-
   // *** if correct_actions is empty, this runs greedy decoding ***
   // the chosen parse actions are inserted into the "results" vector (in training just returns the reference)
   Expression log_prob_parser(ComputationGraph& hg,
@@ -1132,7 +819,7 @@ struct ParserBuilder {
                 S, stack_lstm.back(), 
                 B, buffer_lstm.back(), 
                 A, action_lstm.back(),
-                compressed_typology_to_parser_state, tanh(observed_to_compressed_typology * observed_typology)});
+                ompressed_typology_to_parser_state, tanh(observed_to_compressed_typology * observed_typology)});
           break;
         case TYPOLOGY_MODE_CASCADE:
         case TYPOLOGY_MODE_CASCADE_LEXICAL:
@@ -1715,9 +1402,9 @@ int main(int argc, char** argv) {
     bool first = true;
     int iter = -1;
 
-    unsigned trs = 0, tagging_trs = 0;
-    double right = 0, tagging_right = 0;
-    double llh = 0, tagging_llh = 0;
+    unsigned trs = 0;
+    double right = 0;
+    double llh = 0;
     
     unsigned epoch_count = 0;
     while(!requested_stop) {
@@ -1818,12 +1505,6 @@ int main(int argc, char** argv) {
            << " sum_of_gradient_norms: " << sum_of_gradient_norms
            << " ppl: " << exp(llh / trs) 
            << " err: " << (trs - right) / trs << endl;
-      cerr << "tagging update #" << iter << " (epoch " << (epoch_count) << ")\t"  
-           << "tagging_llh: " << tagging_llh 
-           << " tagging_ppl: " << exp(tagging_llh / tagging_trs) 
-           << " tagging_err: " << (tagging_trs - tagging_right) / tagging_trs << endl;
-      tagging_llh = tagging_trs = tagging_right = llh = trs = right = sum_of_gradient_norms = 0;
-
       static int logc = 0;
       ++logc;
       if ((logc < 100 && logc % 5 == 1) || 
@@ -1831,8 +1512,8 @@ int main(int argc, char** argv) {
         unsigned dev_size = corpus.sentencesDev_count;
         double trs = 0;
         double right = 0;
-        double correct_heads = 0, tagging_correct = 0;
-        double total_heads = 0, tagging_total = 0;
+        double correct_heads = 0;
+        double total_heads = 0;
         auto t_start = std::chrono::high_resolution_clock::now();
         cerr << "train OOV rates:" << endl;
         cerr << "brown OOV rate is " << brown_oov_count << " / " << (brown_oov_count + brown_non_oov_count) << endl;
@@ -1870,7 +1551,6 @@ int main(int argc, char** argv) {
 
         auto t_end = std::chrono::high_resolution_clock::now();
         cerr << "  **dev (iter=" << iter << " epoch=" << (epoch_count + (1.0 * si) / min_sents_per_lang) << ")\tllh=" << llh << " ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << " uas: " << (correct_heads / total_heads) << "\t[" << dev_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
-        cerr << "tagging  **dev (iter=" << iter << " epoch=" << (epoch_count + (1.0 * si) / min_sents_per_lang) << ")" << " err: " << (tagging_total - tagging_correct) / tagging_total << " accuracy: " << (tagging_correct / tagging_total) << "\t[" << dev_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
 
         if (correct_heads > best_correct_heads) {
           best_correct_heads = correct_heads;
@@ -1909,88 +1589,34 @@ int main(int argc, char** argv) {
   } // should do training?
 
   // keep the parser running in the background to serve other processes.
-  if (conf.count("server")) {
-    while (true) {
-      // prompt for input
-      cerr << "Type in a sequence of tokens, e.g., `en:he-pron en:is-verb en:stupid-adj', then press ENTER" << endl;
-      
-      // read input
-      string input_sentence;
-      getline(cin, input_sentence);
+  double llh = 0;
+  double trs = 0;
+  double right = 0;
+  double correct_heads = 0;
+  double total_heads = 0;
+  auto t_start = std::chrono::high_resolution_clock::now();
+  unsigned corpus_size = corpus.sentencesDev_count;
+  for (unsigned sii = 0; sii < corpus_size; ++sii) {
+    vector<TokenInfo> sentence = corpus.sentencesDev[sii];
 
-      // interpret input
-      if (input_sentence == "QUIT" || input_sentence == "EXIT") { break; }
-      istringstream input_sentence_stream(input_sentence);
-      vector<TokenInfo> sentence;
-      while (true) { 
-        string lang_word_pos;
-        input_sentence_stream >> lang_word_pos;
-        cerr << "lang_word_pos = " << lang_word_pos << endl;
-        if (lang_word_pos.size() == 0) { break; }
-        TokenInfo current_token;
-        corpus.ReadTokenInfo(lang_word_pos, current_token);
-        current_token.training_oov = (corpus.training_vocab.count(current_token.word_id) == 0);
-        sentence.push_back(current_token);
-      }
-      TokenInfo root_token;
-      corpus.ReadTokenInfo("ROOT-ROOT", root_token);
-      root_token.training_oov = (corpus.training_vocab.count(root_token.word_id) == 0);
-      sentence.push_back(root_token);
-
-      // tag!
-      ComputationGraph cg;
-      // parse!
-      bool PREDICT_PARSE_TREE = true;
-      if (PREDICT_PARSE_TREE) {
-        double right = 0;
-        vector<unsigned> pred;
-        auto t_start = std::chrono::high_resolution_clock::now();
-        parser.log_prob_parser(cg, sentence, vector<unsigned>(), corpus.actions, &right, pred);
-        auto t_end = std::chrono::high_resolution_clock::now();
-
-        // compute heads
-        unordered_map<int, string> rel_hyp;
-        unordered_map<int,int> hyp = parser.compute_heads(sentence.size(), pred, corpus.actions, &rel_hyp);
-
-        // print output
-        output_conll(sentence, hyp, rel_hyp);
-        cerr << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms" << endl;
-      }
+    ComputationGraph cg;
+    const vector<unsigned>& actions = corpus.correct_act_sentDev[sii];
+    double lp = 0;
+    vector<unsigned> pred;
+    if (beam_size == 1) {
+      parser.log_prob_parser(cg, sentence, vector<unsigned>(), corpus.actions, &right, pred);
+    } else {
+      assert(false && "beam search not implemented");
     }
-    cerr << "The language-universal dependency parsing service has been terminated." << endl;
-  } else { // do test evaluation
-
-    double llh = 0;
-    double trs = 0;
-    double right = 0;
-    double correct_heads = 0, tagging_correct = 0;
-    double total_heads = 0, tagging_total = 0;
-    auto t_start = std::chrono::high_resolution_clock::now();
-    unsigned corpus_size = corpus.sentencesDev_count;
-    for (unsigned sii = 0; sii < corpus_size; ++sii) {
-      vector<TokenInfo> sentence = corpus.sentencesDev[sii];
-
-      ComputationGraph cg;
-      const vector<unsigned>& actions = corpus.correct_act_sentDev[sii];
-      double lp = 0;
-      vector<unsigned> pred;
-      if (beam_size == 1) {
-        parser.log_prob_parser(cg, sentence, vector<unsigned>(), corpus.actions, &right, pred);
-      } else {
-        assert(false && "beam search not implemented");
-      }
-      llh -= lp;
-      trs += actions.size();
-      unordered_map<int, string> rel_ref, rel_hyp;
-      unordered_map<int,int> ref = parser.compute_heads(sentence.size(), actions, corpus.actions, &rel_ref);
-      unordered_map<int,int> hyp = parser.compute_heads(sentence.size(), pred, corpus.actions, &rel_hyp);
-      output_conll(sentence, hyp, rel_hyp);
-      correct_heads += compute_correct(ref, hyp, sentence.size() - 1);
-      total_heads += sentence.size() - 1;
+    llh -= lp;
+    trs += actions.size();
+    unordered_map<int, string> rel_ref, rel_hyp;
+    unordered_map<int,int> ref = parser.compute_heads(sentence.size(), actions, corpus.actions, &rel_ref);
+    unordered_map<int,int> hyp = parser.compute_heads(sentence.size(), pred, corpus.actions, &rel_hyp);
+    output_conll(sentence, hyp, rel_hyp);
+    correct_heads += compute_correct(ref, hyp, sentence.size() - 1);
+    total_heads += sentence.size() - 1;
     }
     auto t_end = std::chrono::high_resolution_clock::now();
     cerr << "TEST llh=" << llh << " ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << " uas: " << (correct_heads / total_heads) << "\t[" << corpus_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
-    cerr << "tagging TEST " << " err: " << (tagging_total - tagging_correct) / tagging_total << " accuracy: " << (tagging_correct / tagging_total) << "\t[" << corpus_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
-
-  }
 }
