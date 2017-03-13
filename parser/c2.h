@@ -415,7 +415,6 @@ inline void load_correct_actionsDev(string file) {
         correct_act_sentDev[sentence_id].push_back(actionIndex);
       } else {
 	cerr << "new actionString in dev set: " << actionString << endl;
-	assert(false);
         // TODO: right now, new actions which haven't been observed in training
         // are not added to correct_act_sentDev. This may be a problem if the
         // training data is little.

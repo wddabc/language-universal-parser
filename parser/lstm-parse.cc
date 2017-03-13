@@ -86,7 +86,6 @@ unsigned LSTM_CHAR_OUTPUT_DIM = 2 * 50;
 bool USE_SPELLING = false;
 
 bool USE_POS = false;
-bool PREDICT_POS = false;
 
 double DROPOUT = 0.0;
 double BLOCK_DROPOUT_WORD_EMBEDDING = 0.0;
@@ -95,7 +94,6 @@ double BLOCK_DROPOUT_PRETRAINED_EMBEDDING = 0.0;
 double BLOCK_DROPOUT_TYPOLOGY_EMBEDDING = 0.0;
 double BLOCK_DROPOUT_FINE_POS_EMBEDDING = 0.0;
 double DROPOUT_FINE_POS_EMBEDDING = 0.0;
-double BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING = 0.0;
 double DROPOUT_COARSE_POS_EMBEDDING = 0.0;
 
 constexpr const char* ROOT_SYMBOL = "ROOT";
@@ -154,7 +152,6 @@ void InitCommandLine(int argc, char** argv, po::variables_map* conf) {
     ("train,t", "Should training be run?")
     ("parsing_model,m", po::value<string>(), "Load saved parsing_model from this file")
     ("server", "Should run the parser as a server which reads input sentences from STDIN and writes the predictiosn to STDOUT?")
-    ("predict_pos", "Should predict POS tags at decoding instead of using gold annotations.")
     // DROPOUT PARAMETERS
     ("dropout", po::value<double>()->default_value(0.0),
      "dropout coefficient for individual elements in the token embedding, "
@@ -970,15 +967,11 @@ struct ParserBuilder {
 
         // use coarse pos embeddings if it was observed in training
         if (corpus.training_pos_vocab.count(tokenInfo.coarse_pos_id)) {
-          unsigned coarse_pos_id = PREDICT_POS? tokenInfo.predicted_coarse_pos_id : tokenInfo.coarse_pos_id;
+          unsigned coarse_pos_id = tokenInfo.coarse_pos_id;
           Expression coarse_p = lookup(hg, p_p, coarse_pos_id);
         
           // Use block dropout with the coarse POS tag so that the parser can make predictions even when they are incorrect
-          if (build_training_graph || BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING == 0.0) {
-            coarse_p = block_dropout(coarse_p, BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING);
-          } else if (!build_training_graph && BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING == 1.0) {
-            coarse_p = 0.0 * coarse_p;
-          }
+          coarse_p = block_dropout(coarse_p, 0.0);
           // Use dropout with the coarse grained POS tag if specified
           if (build_training_graph) {
             coarse_p = dropout(coarse_p, DROPOUT_COARSE_POS_EMBEDDING);
@@ -990,7 +983,7 @@ struct ParserBuilder {
         
         // use fine grained pos embeddings if it was observed in training
         if (corpus.training_pos_vocab.count(tokenInfo.pos_id)) {
-          unsigned fine_pos_id = PREDICT_POS? tokenInfo.predicted_pos_id : tokenInfo.pos_id;
+          unsigned fine_pos_id = tokenInfo.pos_id;
           Expression p = lookup(hg, p_p, fine_pos_id);
           if (tokenInfo.pos_id == 0) {
             // if the fine grained POS tag is not specified, do not use it.
@@ -1346,7 +1339,7 @@ void output_conll(const vector<TokenInfo>& sentence,
   for (unsigned i = 0; i < (sentence.size()-1); ++i) {
     auto index = i + 1;
     string wit = corpus.intToWords.at(sentence[i].word_id);
-    string coarse_pos_tag = corpus.intToPos.at(PREDICT_POS? sentence[i].predicted_coarse_pos_id : sentence[i].coarse_pos_id);
+    string coarse_pos_tag = corpus.intToPos.at(sentence[i].coarse_pos_id);
     string pit = corpus.intToPos.at(sentence[i].pos_id);
     assert(hyp.find(i) != hyp.end());
     auto hyp_head = hyp.find(i)->second + 1;
@@ -1517,7 +1510,6 @@ int main(int argc, char** argv) {
 
   // POS configurations
   USE_POS = conf.count("use_pos_tags");
-  PREDICT_POS = conf.count("predict_pos");
   corpus.COARSE_ONLY = conf.count("coarse_only");
 
   corpus.PREDICT_ATTACHMENTS_ONLY = conf.count("predict_attachments_only");
@@ -1545,12 +1537,6 @@ int main(int argc, char** argv) {
   }
   if (conf.count("dropout_fine_pos_embedding")) {
     DROPOUT_FINE_POS_EMBEDDING = conf["dropout_fine_pos_embedding"].as<double>();
-  }
-  if (conf.count("block_dropout_predicted_pos_embedding")) {
-    // the POS predictions must be pretty bad at the beginning. so we want to dropout all the time initially. 
-    // this block dropout coefficient is updated whenever the POS tagger is evaluated against the dev set.
-    BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING = 0.99;
-    assert(conf.count("predict_pos") == 1 && "Fatal: when the option --block_dropout_predicted_pos_embedding is specified, --predict_pos must be specified.");
   }
   if (conf.count("dropout_coarse_pos_embedding")) {
     DROPOUT_COARSE_POS_EMBEDDING = conf["dropout_coarse_pos_embedding"].as<double>();
@@ -1676,10 +1662,6 @@ int main(int argc, char** argv) {
       if (wc.second == 1) singletons.insert(wc.first);
   }
 
-  if (conf.count("predict_pos")) {
-    // TODO
-  }
-
   // Log some stats about the corpus.
   cerr << "Number of words in training vocab: " << corpus.training_vocab.size() << endl;
   cerr << "Total number of words: " << VOCAB_SIZE << endl;
@@ -1795,22 +1777,6 @@ int main(int argc, char** argv) {
           // use the same computation graph for both tagging and parsing
           //ComputationGraph hg;
             
-          // compute gradient for the tagger
-          if (PREDICT_POS) {
-            ComputationGraph hg;
-            bool build_training_graph = true;
-            Expression log_prob = parser.log_prob_tagger(hg, sentence, &tagging_right, build_training_graph);
-            double lp = as_scalar(hg.incremental_forward(log_prob));
-            if (std::isnan(lp)) {
-              cerr << "WARNING: tagging log_prob = nan" << endl;
-              continue;
-            }
-            assert(!std::isnan(lp) && lp >= -0.1);
-            tagging_llh += lp;
-            tagging_trs += sentence.size() - 1;
-            hg.backward(log_prob);
-          }
-
           // compute gradient for the parser
           bool PREDICT_PARSE_TREE = true;
           if (PREDICT_PARSE_TREE) {
@@ -1880,17 +1846,6 @@ int main(int argc, char** argv) {
           vector<TokenInfo> sentence = corpus.sentencesDev[sii];
           
           ComputationGraph hg;
-
-          if (PREDICT_POS) {
-            bool build_training_graph = false;
-            double dummy;
-            parser.log_prob_tagger(hg, sentence, &dummy, build_training_graph);
-            for (unsigned i = 0; i < sentence.size() - 1; ++i) {
-              ++tagging_total;
-              if (sentence[i].predicted_coarse_pos_id == sentence[i].coarse_pos_id) { ++tagging_correct; }
-            }
-          }
-
           bool PREDICT_PARSE_TREE = true;
           if (PREDICT_PARSE_TREE) {
             const vector<unsigned>& actions = corpus.correct_act_sentDev[sii];
@@ -1916,14 +1871,6 @@ int main(int argc, char** argv) {
         auto t_end = std::chrono::high_resolution_clock::now();
         cerr << "  **dev (iter=" << iter << " epoch=" << (epoch_count + (1.0 * si) / min_sents_per_lang) << ")\tllh=" << llh << " ppl: " << exp(llh / trs) << " err: " << (trs - right) / trs << " uas: " << (correct_heads / total_heads) << "\t[" << dev_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
         cerr << "tagging  **dev (iter=" << iter << " epoch=" << (epoch_count + (1.0 * si) / min_sents_per_lang) << ")" << " err: " << (tagging_total - tagging_correct) / tagging_total << " accuracy: " << (tagging_correct / tagging_total) << "\t[" << dev_size << " sents in " << std::chrono::duration<double, std::milli>(t_end-t_start).count() << " ms]" << endl;
-
-        // if --block_dropout_predicted_pos_embedding is specified, set the dropout coefficient to the error rate of the POS tagger
-        if (BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING > 0) {
-          float tagging_error_rate = (tagging_total - tagging_correct) / tagging_total;
-          assert(tagging_error_rate >= 0.0 && tagging_error_rate <= 1.0 && "Fatal: tagging error rate outside the range [0,1]");
-          BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING = tagging_error_rate;
-          cerr << "debug: setting BLOCK_DROPOUT_PREDICTED_POS_EMBEDDING = " << tagging_error_rate << endl;
-        }
 
         if (correct_heads > best_correct_heads) {
           best_correct_heads = correct_heads;
@@ -1980,7 +1927,6 @@ int main(int argc, char** argv) {
         input_sentence_stream >> lang_word_pos;
         cerr << "lang_word_pos = " << lang_word_pos << endl;
         if (lang_word_pos.size() == 0) { break; }
-        if (PREDICT_POS) { lang_word_pos += "-UNK"; }
         TokenInfo current_token;
         corpus.ReadTokenInfo(lang_word_pos, current_token);
         current_token.training_oov = (corpus.training_vocab.count(current_token.word_id) == 0);
@@ -1993,12 +1939,6 @@ int main(int argc, char** argv) {
 
       // tag!
       ComputationGraph cg;
-      if (PREDICT_POS) { 
-        bool build_training_graph = false;
-        double dummy;
-        parser.log_prob_tagger(cg, sentence, &dummy, build_training_graph);
-      }
-      
       // parse!
       bool PREDICT_PARSE_TREE = true;
       if (PREDICT_PARSE_TREE) {
@@ -2031,16 +1971,6 @@ int main(int argc, char** argv) {
       vector<TokenInfo> sentence = corpus.sentencesDev[sii];
 
       ComputationGraph cg;
-      if (PREDICT_POS) {
-        bool build_training_graph = false;
-        double dummy;
-        parser.log_prob_tagger(cg, sentence, &dummy, build_training_graph);
-        for (unsigned i = 0 ; i < sentence.size() - 1; ++i) {
-          if (sentence[i].predicted_coarse_pos_id == sentence[i].coarse_pos_id) { ++tagging_correct; }
-          ++tagging_total;
-        }
-      }
-
       const vector<unsigned>& actions = corpus.correct_act_sentDev[sii];
       double lp = 0;
       vector<unsigned> pred;
